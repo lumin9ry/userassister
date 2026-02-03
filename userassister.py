@@ -228,31 +228,23 @@ def discover_default_hive():
     candidate = os.path.join(here, "NTUSER.DAT")
     return candidate if os.path.isfile(candidate) else None
 
-def main():
-    ap = argparse.ArgumentParser(description="UserAssist parser for NTUSER.DAT (focus time & timestamps).")
-    ap.add_argument("--hive", help="path to NTUSER.DAT (defaults to ./NTUSER.DAT if present)")
-    ap.add_argument("--out", default="", help="optional output CSV filename")
-    args = ap.parse_args()
+def find_hive_files(root_dir):
+    """Walk *root_dir* and yield paths whose basename is NTUSER.DAT (case-insensitive)."""
+    for dirpath, _dirnames, filenames in os.walk(root_dir):
+        for fn in filenames:
+            if fn.upper() == "NTUSER.DAT":
+                yield os.path.join(dirpath, fn)
 
-    hive_path = args.hive or discover_default_hive()
-    if not hive_path:
-        sys.stderr.write("[!] provide --hive PATH or place NTUSER.DAT in the current directory.\n")
-        sys.exit(1)
-
-    try:
-        reg = Registry.Registry(hive_path)
-    except Exception as e:
-        sys.stderr.write(f"[!] failed to open hive: {hive_path}\n    {e}\n")
-        sys.exit(2)
-
-    # Extract username/hostname once per hive
+def process_hive(hive_path):
+    """Open a single hive, return (username, hostname, rows) or raise on failure."""
+    reg = Registry.Registry(hive_path)
     username = extract_username(reg) or ""
     hostname = extract_hostname(reg) or ""
 
     rows = []
     for guid, raw_name, rot_name, parsed in iter_userassist(reg):
         rows.append({
-            "hive": os.path.basename(hive_path),
+            "hive_path": hive_path,
             "username": username,
             "hostname": hostname,
             "guid": guid,
@@ -269,31 +261,11 @@ def main():
             "note": parsed.get("note"),
             "error": parsed.get("error"),
         })
+    return username, hostname, rows
 
-    if not rows:
-        sys.stderr.write("[!] no UserAssist entries found.\n")
-        sys.exit(3)
-
-    # write CSV
-    fieldnames = [
-        "hive","username","hostname","guid","value_name_raw","value_name_rot13","layout","blob_len",
-        "run_count","focus_count","focus_time_ms","focus_time_s",
-        "last_exec_filetime","last_exec_iso_utc","note","error"
-    ]
-    
-    if not args.out:
-        csvOutput = f"UserAssist_{hostname}_{username}.csv"
-
-    try:
-        with open(csvOutput, "w", newline="", encoding="utf-8") as fp:
-            w = csv.DictWriter(fp, fieldnames=fieldnames)
-            w.writeheader()
-            for r in rows:
-                w.writerow(r)
-    except Exception as e:
-        sys.stderr.write(f"[!] could not write CSV {args.out}: {e}\n")
-
-    # pretty stdout (compact)
+def _print_hive_table(rows, username, hostname, hive_path):
+    """Print a per-hive stdout section with header and entry rows."""
+    print(f"\n=== {hive_path} ===")
     print(f"{username}  @  {hostname}")
     print(f"{'GUID':38}  {'Decoded Name':60}  {'Run':>5}  {'Focus(ms)':>10}  {'Last Exec (UTC)':25}")
     print("-"*38 + "  " + "-"*60 + "  " + "-"*5 + "  " + "-"*10 + "  " + "-"*25)
@@ -303,8 +275,74 @@ def main():
               f"{(r['focus_time_ms'] if r['focus_time_ms'] is not None else ''):>10}  "
               f"{(r['last_exec_iso_utc'] or ''):25}")
 
+def main():
+    ap = argparse.ArgumentParser(description="UserAssist parser for NTUSER.DAT (focus time & timestamps).")
+    ap.add_argument("--hive", help="path to NTUSER.DAT (defaults to ./NTUSER.DAT if present)")
+    ap.add_argument("-r", "--recurse", nargs="?", const=".", default=None,
+                    help="recurse through directory (default: .) to find all NTUSER.DAT files")
+    ap.add_argument("--out", default="", help="optional output CSV filename")
+    args = ap.parse_args()
+
+    # Collect hive paths to process
+    hive_paths = []
+    if args.recurse is not None:
+        root = args.recurse
+        if not os.path.isdir(root):
+            sys.stderr.write(f"[!] not a directory: {root}\n")
+            sys.exit(1)
+        hive_paths = sorted(find_hive_files(root))
+        if not hive_paths:
+            sys.stderr.write(f"[!] no NTUSER.DAT files found under {root}\n")
+            sys.exit(1)
+    else:
+        single = args.hive or discover_default_hive()
+        if not single:
+            sys.stderr.write("[!] provide --hive PATH, -r DIR, or place NTUSER.DAT in the current directory.\n")
+            sys.exit(1)
+        hive_paths = [single]
+
+    # Process each hive
+    all_rows = []
+    for hp in hive_paths:
+        try:
+            username, hostname, rows = process_hive(hp)
+        except Exception as e:
+            sys.stderr.write(f"[!] failed to open hive: {hp}\n    {e}\n")
+            continue
+        if rows:
+            _print_hive_table(rows, username, hostname, hp)
+            all_rows.extend(rows)
+
+    if not all_rows:
+        sys.stderr.write("[!] no UserAssist entries found.\n")
+        sys.exit(3)
+
+    # Determine CSV filename
+    fieldnames = [
+        "hive_path","username","hostname","guid","value_name_raw","value_name_rot13","layout","blob_len",
+        "run_count","focus_count","focus_time_ms","focus_time_s",
+        "last_exec_filetime","last_exec_iso_utc","note","error"
+    ]
+
+    if args.out:
+        csvOutput = args.out
+    elif args.recurse is not None:
+        csvOutput = "UserAssist_recursive.csv"
+    else:
+        username = all_rows[0]["username"]
+        hostname = all_rows[0]["hostname"]
+        csvOutput = f"UserAssist_{hostname}_{username}.csv"
+
+    try:
+        with open(csvOutput, "w", newline="", encoding="utf-8") as fp:
+            w = csv.DictWriter(fp, fieldnames=fieldnames)
+            w.writeheader()
+            for r in all_rows:
+                w.writerow(r)
+    except Exception as e:
+        sys.stderr.write(f"[!] could not write CSV {csvOutput}: {e}\n")
+
     sys.stderr.write(f"\n")
-    #sys.stderr.write(f"[+] wrote {csvOutput}\n")
 
 if __name__ == "__main__":
     main()
