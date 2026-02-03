@@ -304,7 +304,7 @@ def main():
               f"{(r['last_exec_iso_utc'] or ''):25}")
 
     sys.stderr.write(f"\n")
-    sys.stderr.write(f"[+] wrote {csvOutput}\n")
+    #sys.stderr.write(f"[+] wrote {csvOutput}\n")
 
 if __name__ == "__main__":
     main()
